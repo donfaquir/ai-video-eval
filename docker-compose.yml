@@ -1,0 +1,11 @@
+services:
+  video-eval:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.cpu
+    volumes:
+      - ./data:/app/data
+      - ./config.yaml.example:/app/config.yaml
+      - ./results:/app/results
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}

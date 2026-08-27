@@ -1,8 +1,20 @@
 [project]
 name = "video-eval"
 version = "0.1.0"
-description = "AI-generated video quality evaluation framework"
+description = "AI-generated video quality evaluation framework with plugin architecture"
+readme = "README.md"
+license = {text = "Apache-2.0"}
 requires-python = ">=3.11"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "click>=8.0",
     "numpy>=1.24",
@@ -27,6 +39,11 @@ video-eval = "video_eval.cli:main"
 [project.entry-points."video_eval.backends"]
 [project.entry-points."video_eval.extractors"]
 [project.entry-points."video_eval.fusions"]
+
+[project.urls]
+Homepage = "https://github.com/donfaquir/ai-video-eval"
+Repository = "https://github.com/donfaquir/ai-video-eval"
+Issues = "https://github.com/donfaquir/ai-video-eval/issues"
 
 [build-system]
 requires = ["hatchling"]

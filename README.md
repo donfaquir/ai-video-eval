@@ -1,22 +1,170 @@
-# video-eval: AI 生成视频质量评估系统
+# video-eval
 
-开源的 AI 生成视频质量评估框架，插件化架构，支持多维度自动评分。
+AI-generated video quality evaluation framework with plugin architecture, multi-dimension scoring, and VLM-powered analysis.
 
-面向电商场景设计——评估 AI 生成的商品主图视频和外投引流视频的商业效果，同时支持通用 AIGC 视频质量评估。
+## Key Features
 
-## 特性
+- **Plugin Architecture** — Evaluators, extractors, backends, and fusion strategies are all pluggable via entry-points
+- **Multi-Dimension Scoring** — Technical quality, AIGC defects, product fidelity, compliance, and VLM-based subjective judgment
+- **VLM-Powered** — Integrates Gemini, OpenAI, and local Qwen3-VL for intelligent video understanding
+- **Cross-Device** — Auto-detects CUDA / Apple MPS / CPU; develop on Mac, deploy on GPU with zero config changes
+- **Structured Output** — Each dimension produces score + evidence + reasoning + suggestion, ready for downstream systems
+- **Batch Processing** — Directory scan or CSV manifest for bulk evaluation
 
-- **插件化**：每个评估维度是一个独立插件，社区可贡献新插件
-- **跨设备**：自动适配 CUDA / Apple MPS / CPU，Mac 调试 → GPU 部署零改动
-- **Docker 部署**：提供 CPU / GPU 两套镜像
-- **结构化输出**：每个维度输出分数 + 证据 + 建议，可直接接入业务系统
-- **业务维度**：覆盖商品还原、卖点覆盖、CTA 命中、营销逻辑、合规审查等商业评估维度
+## Quick Start
 
-## 文档
+```bash
+pip install video-eval
 
-- [设计方案](docs/design.md)
-- [竞品分析](docs/competitor-analysis.md)
+# Evaluate a single video
+video-eval eval --video demo.mp4 --video-type general
+
+# Check device capabilities
+video-eval device info
+```
+
+## Installation
+
+### Basic (CPU, mock backend)
+
+```bash
+pip install video-eval
+```
+
+### With optional features
+
+```bash
+pip install 'video-eval[asr]'    # ASR extraction (faster-whisper)
+pip install 'video-eval[ocr]'    # OCR extraction (easyocr)
+pip install 'video-eval[gpu]'    # GPU support (torch + open-clip)
+pip install 'video-eval[all]'    # Everything
+```
+
+### From source
+
+```bash
+git clone https://github.com/anthropics/video-eval.git
+cd video-eval
+pip install -e '.[dev]'
+```
+
+See [docs/getting-started.md](docs/getting-started.md) for Docker and detailed setup instructions.
+
+## CLI Usage
+
+### Single video evaluation
+
+```bash
+video-eval eval \
+  --video product_hero.mp4 \
+  --video-type main_image \
+  --product-title "Wireless Earbuds Pro" \
+  --selling-points "Active noise cancellation" \
+  --selling-points "40h battery life" \
+  --output report.json
+```
+
+### Feature extraction only
+
+```bash
+video-eval extract --video demo.mp4 --output features.json
+```
+
+### Batch evaluation
+
+```bash
+# From directory (all .mp4/.avi/.mov/.mkv/.webm/.flv files)
+video-eval batch --input ./videos/ --output results.json
+
+# From CSV manifest
+video-eval batch --input manifest.csv --output-format jsonl --output results.jsonl
+```
+
+### Plugin management
+
+```bash
+video-eval plugins                        # List all registered plugins
+video-eval plugins --type evaluator       # Filter by type
+video-eval plugins --detail vlm_judge     # Show plugin details
+video-eval plugins --available-only       # Only device-compatible plugins
+```
+
+### Configuration
+
+```bash
+video-eval config check                   # Validate current config
+video-eval config check --config my.yaml  # Validate specific file
+```
+
+### Device info
+
+```bash
+video-eval device info                    # Show device, memory, backend status
+```
+
+### Config overrides via --set
+
+```bash
+video-eval eval --video demo.mp4 --video-type general \
+  --set evaluators.vlm_judge.backend=api \
+  --set backends.api.provider=openai
+```
+
+## Configuration
+
+video-eval uses a three-layer configuration system (defaults < config file < CLI overrides).
+
+Copy the example config to get started:
+
+```bash
+cp config.yaml.example config.yaml
+```
+
+See [docs/configuration.md](docs/configuration.md) for the full reference.
+
+## Architecture
+
+```
+┌─────────┐     ┌────────────┐     ┌────────────┐     ┌────────┐     ┌────────┐
+│  Input  │────▶│ Extractors │────▶│ Evaluators │────▶│ Fusion │────▶│ Output │
+│ (video) │     │            │     │            │     │        │     │(report)│
+└─────────┘     └────────────┘     └────────────┘     └────────┘     └────────┘
+                 video_meta          technical_quality   weighted_veto   JSON
+                 asr                  aigc_defect                        JSONL
+                 ocr                  product_fidelity
+                 clip_features        compliance
+                                     vlm_judge ──▶ Backend (mock/api/local)
+```
+
+All components are discovered via the **Registry** system, supporting both built-in plugins and third-party packages installed via pip entry-points.
+
+See [docs/architecture.md](docs/architecture.md) for contributor-level details.
+
+## Plugin Development
+
+Create custom evaluators, backends, or extractors and distribute them as pip packages:
+
+```python
+from video_eval.core.base import BaseEvaluator
+from video_eval.core.registry import register_evaluator
+
+@register_evaluator("my_custom_eval")
+class MyCustomEvaluator(BaseEvaluator):
+    name = "my_custom_eval"
+    ...
+```
+
+See [docs/plugin-development.md](docs/plugin-development.md) for the full guide.
+
+## Documentation
+
+- [Getting Started](docs/getting-started.md) — Installation, Docker, first evaluation
+- [Configuration Reference](docs/configuration.md) — All config options explained
+- [Plugin Development](docs/plugin-development.md) — Build and publish custom plugins
+- [Architecture](docs/architecture.md) — Internals for contributors
+- [Contributing](CONTRIBUTING.md) — How to contribute
+- [Changelog](CHANGELOG.md) — Release history
 
 ## License
 
-Apache-2.0
+[Apache-2.0](LICENSE)
