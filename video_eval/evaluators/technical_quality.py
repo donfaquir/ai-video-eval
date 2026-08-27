@@ -47,14 +47,16 @@ class TechnicalQualityEvaluator(BaseEvaluator):
         scores: list[float] = []
         evidence: dict = {}
 
-        # 1. Resolution score
+        # 1. Resolution score (orientation-agnostic: use long/short edge)
         if meta is not None:
             w, h = meta.resolution
-            if w >= 1920 and h >= 1080:
+            long_edge = max(w, h)
+            short_edge = min(w, h)
+            if long_edge >= 1920 and short_edge >= 1080:
                 scores.append(1.0)
-            elif w >= 1280 and h >= 720:
+            elif long_edge >= 1280 and short_edge >= 720:
                 scores.append(0.75)
-            elif w >= 640 and h >= 480:
+            elif long_edge >= 640 and short_edge >= 480:
                 scores.append(0.5)
             else:
                 scores.append(0.25)
