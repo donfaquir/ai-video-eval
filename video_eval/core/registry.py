@@ -450,7 +450,10 @@ def register_backend(name: str) -> Callable[[type[T]], type[T]]:
 
 
 def register_extractor(name: str) -> Callable[[type[T]], type[T]]:
-    """Decorator: register a class as an extractor plugin."""
+    """Decorator: register a class as an extractor plugin.
+
+    Also checks for provides field conflicts with existing extractors.
+    """
 
     def decorator(cls: type[T]) -> type[T]:
         if getattr(cls, "name", None) != name:
@@ -458,6 +461,18 @@ def register_extractor(name: str) -> Callable[[type[T]], type[T]]:
                 f"Alias '{name}' != cls.name '{getattr(cls, 'name', None)}'",
                 "extractor",
             )
+        # Check provides conflict before registration
+        new_provides = set(getattr(cls, "provides", []))
+        if new_provides:
+            for existing_name in extractor_registry.list():
+                existing_meta = extractor_registry.get_meta(existing_name)
+                overlap = new_provides & set(existing_meta.provides)
+                if overlap:
+                    raise DuplicateRegistrationError(
+                        f"Extractor '{name}' provides {overlap} which conflicts "
+                        f"with existing extractor '{existing_name}'",
+                        "extractor",
+                    )
         extractor_registry.register(name, cls=cls, origin="builtin")
         return cls
 
