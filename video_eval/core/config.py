@@ -353,15 +353,18 @@ class ConfigLoader:
                 continue
             meta = evaluator_registry.get_meta(eval_name)
             if meta.backend_config_key:
-                if not backend_registry.has(meta.backend_config_key):
+                # backend_config_key is the CONFIG KEY name (e.g. "backend"),
+                # read its VALUE from eval config to get the actual backend name
+                selected_backend = eval_conf.get(meta.backend_config_key)
+                if selected_backend and not backend_registry.has(selected_backend):
                     issues.append(ValidationIssue(
                         severity="error",
                         plugin_name=eval_name,
                         message=(
-                            f"Evaluator '{eval_name}' declares backend_config_key "
-                            f"'{meta.backend_config_key}' which is not registered."
+                            f"Evaluator '{eval_name}' references backend "
+                            f"'{selected_backend}' which is not registered."
                         ),
-                        field="backend_config_key",
+                        field=meta.backend_config_key,
                     ))
 
         # Rule 9: resident mode memory estimation
