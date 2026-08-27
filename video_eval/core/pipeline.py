@@ -79,8 +79,10 @@ class Pipeline:
         # 8. Run evaluators (serial, with context manager)
         results = self._run_evaluators(context, filtered)
 
-        # 9. Fill placeholders
-        results = self._fill_placeholders(results, evaluators, filtered, video_type)
+        # 9. Fill placeholders (pass context for extraction_failed evidence)
+        results = self._fill_placeholders(
+            results, evaluators, filtered, video_type, context
+        )
 
         # 10. Build default_weights
         default_weights = self._build_default_weights(evaluators)
@@ -751,11 +753,13 @@ class Pipeline:
         evaluators: list[EvaluatorInfo],
         filtered: list[EvaluatorInfo],
         video_type: str,
+        context: EvalContext | None = None,
     ) -> dict[str, EvalResult]:
         """Generate placeholder EvalResults for skipped/error evaluators.
 
         Expands multi-slot evaluators into all their effective_slots.
         Disabled evaluators (F1) do NOT generate placeholders.
+        For extraction_failed: evidence carries failure summary (§4.4 C3/v6).
         """
         for info in evaluators:
             # Skip active evaluators (already have results) and disabled ones
@@ -770,6 +774,19 @@ class Pipeline:
                 # normally, but be defensive)
                 continue
 
+            # Build evidence for extraction_failed (§4.4 C3/v6)
+            evidence = None
+            if info.reason == "extraction_failed" and context is not None:
+                failed_fields = set(info.meta.requires) & set(
+                    context.extraction_failures.keys()
+                )
+                if failed_fields:
+                    evidence = {
+                        "extraction_failures": {
+                            f: context.extraction_failures[f] for f in failed_fields
+                        }
+                    }
+
             # Generate placeholder for each effective_slot
             status = info.status if info.status in ("skipped", "error") else "skipped"
             for slot in info.effective_slots:
@@ -780,6 +797,7 @@ class Pipeline:
                         score=0.0,
                         status=status,
                         reason=info.reason,
+                        evidence=evidence,
                     )
 
         return results
@@ -791,34 +809,33 @@ class Pipeline:
     def _build_default_weights(
         self, evaluators: list[EvaluatorInfo]
     ) -> dict[str, float | None]:
-        """Build default_weights dict from evaluator metadata.
+        """Build dimension -> default weight mapping from evaluator metadata.
 
-        For single-slot evaluators: {name: default_weights} (float or None).
-        For multi-slot evaluators with dict default_weights: expand per-slot.
+        Algorithm per §2.4 _build_default_weights:
+        - None: all effective_slots get None
+        - float: single-slot evaluator -> dimension = evaluator name -> float
+        - dict: multi-slot -> per sub-dimension lookup; missing keys -> None
         """
-        weights: dict[str, float | None] = {}
+        dw_map: dict[str, float | None] = {}
 
         for info in evaluators:
-            dw = info.meta.default_weights
+            meta_dw = info.meta.default_weights
 
-            if dw is None:
-                # No declared default weight: all slots get None
+            if meta_dw is None:
                 for slot in info.effective_slots:
-                    weights.setdefault(slot, None)
-            elif isinstance(dw, (int, float)):
-                # Single weight applies to all slots (split evenly if multi-slot)
-                if len(info.effective_slots) == 1:
-                    weights.setdefault(info.effective_slots[0], float(dw))
-                else:
-                    per_slot = float(dw) / len(info.effective_slots)
-                    for slot in info.effective_slots:
-                        weights.setdefault(slot, per_slot)
-            elif isinstance(dw, dict):
-                # Per-slot weights
+                    dw_map.setdefault(slot, None)
+            elif isinstance(meta_dw, (int, float)):
+                # Single-slot: dimension = evaluator name (§2.4 spec)
+                dw_map[info.meta.name] = float(meta_dw)
+            else:
+                # dict: per sub-dimension
+                for dim, w in meta_dw.items():
+                    dw_map[dim] = w
+                # effective_slots not in dict -> None
                 for slot in info.effective_slots:
-                    weights.setdefault(slot, dw.get(slot))
+                    dw_map.setdefault(slot, None)
 
-        return weights
+        return dw_map
 
     # ==================================================================
     # Step 11: Fuse
@@ -856,25 +873,26 @@ class Pipeline:
             if info.status == "active":
                 evaluator_versions[info.meta.name] = info.meta.version
 
-        # Collect skipped evaluator names
-        skipped = [
-            info.meta.name
-            for info in evaluators
-            if info.status in ("skipped", "error")
-            and info.reason != "disabled"
-            and info.reason != "no_slots_for_video_type"
-        ]
+        # Collect skipped dimension names (expand multi-slot by effective_slots)
+        skipped: list[str] = []
+        for info in evaluators:
+            if info.status in ("skipped", "error") and info.reason not in (
+                "disabled", "no_slots_for_video_type"
+            ):
+                skipped.extend(info.effective_slots)
 
-        # Determine backend info
-        backend_name = "none"
-        vlm_model = "none"
-        evaluators_cfg = self.config.get("evaluators", {})
-        for eval_name, eval_conf in evaluators_cfg.items():
-            if isinstance(eval_conf, dict) and eval_conf.get("backend"):
-                backend_name = eval_conf["backend"]
-                backends_cfg = self.config.get("backends", {})
-                backend_conf = backends_cfg.get(backend_name, {})
-                vlm_model = backend_conf.get("model", "unknown")
+        # Determine backend info (§3.4: "n/a" when vlm_judge not active)
+        backend_name = "n/a"
+        vlm_model = "n/a"
+        for info in evaluators:
+            if info.status == "active" and info.meta.backend_config_key:
+                # This evaluator used a backend and was active
+                bkey = info.config.get(info.meta.backend_config_key, "")
+                if bkey:
+                    backend_name = bkey
+                    backends_cfg = self.config.get("backends", {})
+                    backend_conf = backends_cfg.get(bkey, {})
+                    vlm_model = backend_conf.get("model", "n/a")
                 break
 
         meta = ReportMeta(
