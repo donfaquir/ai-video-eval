@@ -218,6 +218,184 @@ def eval_cmd(
 
 
 # ---------------------------------------------------------------------------
+# extract command
+# ---------------------------------------------------------------------------
+
+
+@main.command("extract")
+@click.option("--video", required=True, type=click.Path(exists=True), help="Path to the video file.")
+@click.option("--config", "config_path", default=None, type=click.Path(), help="Config YAML path.")
+@click.option("--set", "overrides", multiple=True, help="Config override in KEY=VALUE format.")
+@click.option(
+    "--device",
+    default=None,
+    type=click.Choice(["auto", "cuda", "mps", "cpu"]),
+    help="Device preference.",
+)
+@click.option("--output", default=None, type=click.Path(), help="Output file path (default: stdout).")
+@click.option("-v", "--verbose", is_flag=True, help="Enable verbose logging.")
+def extract_cmd(
+    video: str,
+    config_path: str | None,
+    overrides: tuple[str, ...],
+    device: str | None,
+    output: str | None,
+    verbose: bool,
+) -> None:
+    """Extract features from a video (ASR, OCR, metadata, CLIP)."""
+    _setup_logging(verbose)
+
+    from video_eval.core.config import ConfigLoader
+    from video_eval.core.device import DeviceManager
+    from video_eval.core.exceptions import ConfigError, ExtractionError
+    from video_eval.core.registry import initialize_registries, extractor_registry
+    from video_eval.core.schemas import EvalContext
+
+    initialize_registries()
+
+    # Load config
+    loader = ConfigLoader(config_path)
+    try:
+        config = loader.load()
+        config = loader.merge_cli_overrides(config, list(overrides))
+    except ConfigError as e:
+        click.echo(f"ERROR: {e}", err=True)
+        sys.exit(2)
+
+    # Setup
+    preferred = None if device in (None, "auto") else device
+    dm = DeviceManager(preferred)
+
+    # Determine which extractors to run (all enabled + device-satisfied)
+    extractor_config = config.get("extractors", {})
+    extractors_to_run = []
+    for meta in extractor_registry.list_meta():
+        if not extractor_config.get(meta.name, {}).get("enabled", True):
+            continue
+        if not dm.satisfies(meta.device_requirement):
+            continue
+        extractors_to_run.append(meta)
+
+    # Topological sort by requires → provides
+    sorted_extractors = _topo_sort_extractors(extractors_to_run)
+
+    # Run extractors
+    context = EvalContext(video_path=video, video_type="general")
+    extraction_data: dict[str, Any] = {}
+
+    for meta in sorted_extractors:
+        ext_cfg = dict(extractor_config)  # top-level shared keys
+        ext_cfg.update(extractor_config.get(meta.name, {}))  # per-extractor override
+
+        try:
+            cls = extractor_registry.get(meta.name)
+            instance = cls(dm, ext_cfg)
+            instance.__enter__()
+            try:
+                result = instance.extract(context.readonly())
+                context.merge(result, declared_provides=meta.provides)
+                extraction_data[meta.name] = {
+                    "status": "success",
+                    "provides": meta.provides,
+                    "data": _serialize_extraction(meta.name, result),
+                }
+            except Exception as exc:
+                extraction_data[meta.name] = {
+                    "status": "error",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+                if meta.criticality == "required":
+                    click.echo(f"ERROR: Required extractor '{meta.name}' failed: {exc}", err=True)
+                    sys.exit(6)
+            finally:
+                try:
+                    instance.__exit__(None, None, None)
+                except Exception:
+                    pass
+        except Exception as exc:
+            extraction_data[meta.name] = {
+                "status": "init_failed",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+            if meta.criticality == "required":
+                click.echo(f"ERROR: Required extractor '{meta.name}' failed: {exc}", err=True)
+                sys.exit(6)
+
+    # Output
+    output_dict = {
+        "video_path": video,
+        "device": dm.device_type,
+        "extractors": extraction_data,
+    }
+    json_str = json.dumps(output_dict, ensure_ascii=False, indent=2, default=str)
+    if output:
+        Path(output).write_text(json_str)
+    else:
+        click.echo(json_str)
+
+
+def _topo_sort_extractors(metas: list) -> list:
+    """Simple topological sort for extractors by requires/provides."""
+    provides_map: dict[str, str] = {}  # field → extractor name
+    for m in metas:
+        for field in m.provides:
+            provides_map[field] = m.name
+
+    # Build adjacency: if A requires field provided by B → B must come before A
+    from collections import defaultdict, deque
+
+    in_degree: dict[str, int] = {m.name: 0 for m in metas}
+    graph: dict[str, list[str]] = defaultdict(list)
+
+    for m in metas:
+        for req_field in m.requires:
+            provider = provides_map.get(req_field)
+            if provider and provider != m.name:
+                graph[provider].append(m.name)
+                in_degree[m.name] += 1
+
+    queue = deque(name for name, deg in in_degree.items() if deg == 0)
+    result = []
+    while queue:
+        node = queue.popleft()
+        result.append(node)
+        for neighbor in graph[node]:
+            in_degree[neighbor] -= 1
+            if in_degree[neighbor] == 0:
+                queue.append(neighbor)
+
+    name_to_meta = {m.name: m for m in metas}
+    return [name_to_meta[n] for n in result if n in name_to_meta]
+
+
+def _serialize_extraction(extractor_name: str, result: dict) -> dict:
+    """Convert extraction results to JSON-serializable form."""
+    serialized = {}
+    for key, value in result.items():
+        if value is None:
+            serialized[key] = None
+        elif hasattr(value, "model_dump"):
+            # Pydantic model (VideoMeta, AsrResult)
+            serialized[key] = value.model_dump()
+        elif isinstance(value, list) and value and hasattr(value[0], "model_dump"):
+            # List of pydantic models (OcrItem, FrameItem)
+            if key == "frames":
+                # Don't serialize actual image data, just metadata
+                serialized[key] = [
+                    {"frame_idx": f.frame_idx, "timestamp": f.timestamp, "image_size": f"({f.image.width}x{f.image.height})" if hasattr(f.image, "width") else "unknown"}
+                    for f in value
+                ]
+            else:
+                serialized[key] = [item.model_dump() for item in value]
+        elif hasattr(value, "shape"):
+            # Tensor
+            serialized[key] = {"type": "tensor", "shape": list(value.shape), "dtype": str(value.dtype)}
+        else:
+            serialized[key] = str(value)
+    return serialized
+
+
+# ---------------------------------------------------------------------------
 # batch command
 # ---------------------------------------------------------------------------
 
