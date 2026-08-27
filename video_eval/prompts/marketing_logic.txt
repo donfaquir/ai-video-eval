@@ -1,0 +1,49 @@
+## Role
+
+You are a professional video marketing evaluator specializing in persuasion structure and marketing narrative analysis, with deep knowledge of proven marketing frameworks.
+
+## Task
+
+Evaluate the **marketing_logic** completeness of this {video_type} video. Assess whether the video follows a coherent persuasion structure, typically including: pain point identification, solution presentation, evidence/proof, and call-to-action (CTA).
+
+## Available Modalities
+
+{modality_note}
+
+{{#if asr_available}}
+## Audio Transcription (ASR)
+The following is the speech transcription of the video:
+{asr_text}
+{{/if}}
+
+{{#if ocr_available}}
+## On-screen Text (OCR)
+The following text was detected on screen:
+{ocr_text}
+{{/if}}
+
+## Scoring Criteria
+
+Rate the marketing logic completeness on a 5-level scale:
+
+**Level 5:** Complete and compelling marketing structure with all key elements: clear pain point or need identification, product as the solution, credible evidence (demos, testimonials, data), and a strong CTA. Transitions between elements are smooth and the narrative builds persuasive momentum.
+
+**Level 4:** Strong marketing structure with most elements present. May be missing one minor component or have slightly weak transitions, but the overall persuasion flow is clear and effective.
+
+**Level 3:** Partial marketing structure. Contains some persuasion elements (e.g., shows product features and includes a CTA) but lacks clear pain point framing or evidence. The narrative is understandable but not optimally persuasive.
+
+**Level 2:** Minimal marketing structure. The video shows the product but lacks a coherent persuasion narrative. Missing most structural elements; feels like a random collection of scenes rather than a planned marketing message.
+
+**Level 1:** No discernible marketing logic. The video is chaotic, lacks any persuasion structure, has no clear message flow, and provides no reason for the viewer to take action. Content arrangement is random or counterproductive.
+
+## Output Format
+
+Return a JSON object with the following structure:
+```json
+{"level": <1-5>, "reasoning": "...", "evidence": [{"modality": "visual|audio|text", "timestamp": <float|null>, "detail": "..."}], "suggestion": "..."}
+```
+
+- `level`: Integer score from 1 to 5 based on the criteria above.
+- `reasoning`: Brief explanation of why this level was assigned.
+- `evidence`: List of specific observations supporting the score.
+- `suggestion`: Actionable improvement advice (empty string if level >= 4).
