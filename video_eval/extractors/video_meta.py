@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import io
 import json
+import logging
+import math
 import shutil
 import subprocess
 from typing import TYPE_CHECKING
+
+import numpy as np
+from PIL import Image
 
 from video_eval.core.base import BaseExtractor
 from video_eval.core.registry import register_extractor
@@ -13,6 +19,8 @@ from video_eval.core.schemas import FrameItem, VideoMeta
 
 if TYPE_CHECKING:
     from video_eval.core.schemas import ReadonlyEvalContext
+
+logger = logging.getLogger(__name__)
 
 
 @register_extractor("video_meta")
@@ -49,6 +57,8 @@ class VideoMetaExtractor(BaseExtractor):
         video_path = context.video_path
         meta = self._probe(video_path)
         frames = self._extract_frames(video_path, meta)
+        scene_changes = self._detect_scene_changes(frames)
+        meta = meta.model_copy(update={"scene_changes": scene_changes})
         return {"video_meta": meta, "frames": frames}
 
     def _probe(self, video_path: str) -> VideoMeta:
@@ -61,13 +71,25 @@ class VideoMetaExtractor(BaseExtractor):
             "-show_format",
             video_path,
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError(
+                f"ffprobe execution failed for '{video_path}': {exc}"
+            ) from exc
+
         if result.returncode != 0:
             raise RuntimeError(
                 f"ffprobe failed for '{video_path}': {result.stderr.strip()}"
             )
 
-        data = json.loads(result.stdout)
+        try:
+            data = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"ffprobe returned invalid JSON for '{video_path}': {exc}"
+            ) from exc
+
         streams = data.get("streams", [])
         fmt = data.get("format", {})
 
@@ -118,30 +140,43 @@ class VideoMetaExtractor(BaseExtractor):
         )
 
     def _extract_frames(self, video_path: str, meta: VideoMeta) -> list[FrameItem]:
-        """Extract frames at configured fps, capped at max_frames."""
-        from PIL import Image
-        import io
+        """Extract frames with smart sampling strategy.
 
+        Strategy:
+        1. Uniform sampling at config_fps (e.g., 1 fps)
+        2. Total frames capped at max_frames
+        3. Always include first and last frame
+        """
         config_fps = self.config.get("fps", 1)
         max_frames = self.config.get("max_frames", 64)
 
         # Calculate number of frames to extract
         if meta.duration <= 0:
-            num_frames = 1
+            timestamps = [0.0]
         else:
-            num_frames = min(int(meta.duration * config_fps), max_frames)
-        num_frames = max(num_frames, 1)
+            num_frames = min(math.ceil(meta.duration * config_fps), max_frames)
+            num_frames = max(num_frames, 2)  # at least first + last
 
-        # Calculate interval between frames
-        if meta.duration <= 0:
-            interval = 0.0
-        else:
-            interval = meta.duration / num_frames
+            if num_frames == 2:
+                timestamps = [0.0, meta.duration]
+            else:
+                # Generate uniform timestamps, always including first and last
+                # Interior frames are evenly spaced between 0 and duration
+                interior_count = num_frames - 2
+                interval = meta.duration / (interior_count + 1)
+                timestamps = [0.0]
+                for i in range(1, interior_count + 1):
+                    timestamps.append(i * interval)
+                timestamps.append(meta.duration)
+
+        # Clamp last timestamp before end to avoid seek-past-end issues.
+        # Use 1/fps margin (at least 0.1s) to ensure the last seek lands on a frame.
+        if len(timestamps) > 1 and meta.duration > 0:
+            margin = max(1.0 / meta.fps, 0.1) if meta.fps > 0 else 0.1
+            timestamps[-1] = min(timestamps[-1], max(meta.duration - margin, 0.0))
 
         frames: list[FrameItem] = []
-        for i in range(num_frames):
-            timestamp = i * interval
-            # Use ffmpeg to extract a single frame at the given timestamp
+        for idx, timestamp in enumerate(timestamps):
             cmd = [
                 "ffmpeg",
                 "-ss", f"{timestamp:.3f}",
@@ -152,15 +187,79 @@ class VideoMetaExtractor(BaseExtractor):
                 "-loglevel", "quiet",
                 "pipe:1",
             ]
-            result = subprocess.run(
-                cmd, capture_output=True, timeout=10
-            )
-            if result.returncode != 0 or not result.stdout:
+            try:
+                result = subprocess.run(cmd, capture_output=True, timeout=10)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                logger.warning(
+                    "Frame extraction failed at timestamp %.3f for '%s': %s",
+                    timestamp, video_path, exc,
+                )
                 continue
 
-            image = Image.open(io.BytesIO(result.stdout))
+            if result.returncode != 0 or not result.stdout:
+                logger.warning(
+                    "Frame decode failed at timestamp %.3f for '%s' "
+                    "(returncode=%d, output_size=%d)",
+                    timestamp, video_path, result.returncode, len(result.stdout),
+                )
+                continue
+
+            try:
+                image = Image.open(io.BytesIO(result.stdout))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "PIL failed to open frame at timestamp %.3f for '%s': %s",
+                    timestamp, video_path, exc,
+                )
+                continue
+
             frames.append(
-                FrameItem(frame_idx=i, timestamp=timestamp, image=image)
+                FrameItem(frame_idx=idx, timestamp=timestamp, image=image)
             )
 
         return frames
+
+    def _detect_scene_changes(
+        self, frames: list[FrameItem], threshold: float = 30.0
+    ) -> list[int]:
+        """Compare adjacent frames by mean absolute pixel difference.
+
+        Returns list of frame indices where scene change detected.
+        Non-blocking: errors are logged and an empty list is returned.
+        """
+        if len(frames) < 2:
+            return []
+
+        scene_change_indices: list[int] = []
+        try:
+            prev_array = np.array(
+                frames[0].image.convert("RGB"), dtype=np.float32
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Scene change detection skipped: %s", exc)
+            return []
+
+        for i in range(1, len(frames)):
+            try:
+                curr_array = np.array(
+                    frames[i].image.convert("RGB"), dtype=np.float32
+                )
+                # Resize if dimensions differ (shouldn't normally happen)
+                if prev_array.shape != curr_array.shape:
+                    curr_image = frames[i].image.convert("RGB").resize(
+                        (prev_array.shape[1], prev_array.shape[0])
+                    )
+                    curr_array = np.array(curr_image, dtype=np.float32)
+
+                diff = np.mean(np.abs(curr_array - prev_array))
+                if diff > threshold:
+                    scene_change_indices.append(frames[i].frame_idx)
+                prev_array = curr_array
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Scene change detection error at frame %d: %s",
+                    frames[i].frame_idx, exc,
+                )
+                continue
+
+        return scene_change_indices

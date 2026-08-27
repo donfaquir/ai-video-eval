@@ -15,6 +15,7 @@ class VideoMeta(BaseModel):
     fps: float
     bitrate: int
     has_audio: bool
+    scene_changes: list[int] = []
 
 
 class FrameItem(BaseModel):
