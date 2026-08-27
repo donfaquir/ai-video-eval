@@ -1,0 +1,89 @@
+device:
+  preferred: auto
+
+extractors:
+  fps: 1
+  max_frames: 64
+  asr:
+    enabled: true
+    model_size: large-v3
+    language: auto
+    beam_size: 5
+  ocr:
+    confidence: 0.5
+  clip_features:
+    model_name: ViT-SO400M-14-SigLIP-384
+
+backends:
+  local:
+    model: Qwen/Qwen3-VL-8B-Instruct
+  api:
+    provider: gemini
+    model: gemini-3-flash
+    timeout: 30
+    max_retries: 3
+    retry_base: 1.0
+  mock: {}
+
+evaluators:
+  technical_quality:
+    enabled: true
+  aigc_defect:
+    enabled: true
+    model: openai/clip-vit-large-patch14
+    defect_threshold: 0.6
+  product_fidelity:
+    enabled: true
+  compliance:
+    enabled: true
+    limit_words: ["最", "第一", "国家级", "顶级", "极品", "全网最低", "独家"]
+    medical_words: ["治疗", "疗效", "药到病除", "根治"]
+    banned_entities: []
+  vlm_judge:
+    enabled: true
+    backend: mock
+    api_concurrency: 4
+    api_max_failures: 5
+    dimensions_main_image: [sellpoint_coverage, cross_modal]
+    dimensions_external: [hook_strength, marketing_logic, audience_match, cross_modal]
+    dimensions_general: [cross_modal]
+
+fusion:
+  strategy: weighted_veto
+  strict_veto_dims: [compliance]
+  thresholds:
+    A: 0.75
+    B: 0.60
+    C: 0.40
+  veto_thresholds:
+    compliance: 0.0
+    product_fidelity: 0.3
+    aigc_defect: 0.3
+  weights_main_image:
+    technical_quality: 0.15
+    aigc_defect: 0.15
+    product_fidelity: 0.20
+    sellpoint_coverage: 0.20
+    cross_modal: 0.10
+  weights_external:
+    technical_quality: 0.10
+    aigc_defect: 0.10
+    product_fidelity: 0.10
+    hook_strength: 0.20
+    marketing_logic: 0.15
+    audience_match: 0.10
+    cross_modal: 0.05
+  weights_general:
+    technical_quality: 0.35
+    aigc_defect: 0.35
+    cross_modal: 0.30
+
+batch:
+  mode: resident
+  chunk_size: 8
+
+output:
+  format: json
+  include_meta: true
+  include_evidence: true
+  pretty: true
