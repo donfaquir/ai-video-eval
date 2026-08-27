@@ -37,22 +37,33 @@ class LocalBackend(BaseBackend):
             )
 
         try:
-            from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+            from transformers import AutoProcessor, AutoModelForImageTextToText
         except ImportError:
             raise RuntimeError(
-                "transformers package is not installed or does not support Qwen2.5-VL. "
-                "Install it with: pip install transformers>=4.37"
+                "transformers package is not installed. "
+                "Install it with: pip install transformers>=5.0"
             )
 
         model_name = self.config.get("model", "Qwen/Qwen3-VL-8B-Instruct")
         self._max_new_tokens: int = self.config.get("max_new_tokens", 1024)
 
         self._processor = AutoProcessor.from_pretrained(model_name)
-        self._model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model_name,
-            torch_dtype=self.device_manager.dtype,
-            device_map="auto",
+
+        # MPS does not support device_map="auto" (accelerate offloading).
+        # Load to CPU first then move to device manually.
+        load_kwargs: dict[str, Any] = {"dtype": self.device_manager.dtype}
+        if self.device_manager.device_type == "cuda":
+            load_kwargs["device_map"] = "auto"
+        else:
+            # MPS / CPU: load without device_map, move manually
+            load_kwargs["device_map"] = None
+
+        self._model = AutoModelForImageTextToText.from_pretrained(
+            model_name, **load_kwargs
         )
+
+        if self.device_manager.device_type == "mps":
+            self._model = self._model.to(self.device_manager.device)
 
         # D8: frame tensor cache (capacity=1)
         self._frame_cache: dict[str, Any] = {}
