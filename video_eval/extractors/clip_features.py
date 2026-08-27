@@ -57,16 +57,28 @@ class CLIPFeaturesExtractor(BaseExtractor):
                 model_name,
                 pretrained="webli",
             )
-        except Exception:
-            logger.info(
-                "Failed to load '%s' with pretrained='webli', "
-                "falling back to default pretrained.",
-                model_name,
-            )
-            model, _, preprocess = open_clip.create_model_and_transforms(
-                model_name,
-                pretrained="",
-            )
+        except Exception as first_err:
+            # Try common alternative pretrained tags before giving up
+            for alt_pretrained in ("openai", "laion2b_s34b_b79k"):
+                try:
+                    model, _, preprocess = open_clip.create_model_and_transforms(
+                        model_name,
+                        pretrained=alt_pretrained,
+                    )
+                    logger.info(
+                        "Loaded '%s' with pretrained='%s' (webli unavailable).",
+                        model_name, alt_pretrained,
+                    )
+                    break
+                except Exception:
+                    continue
+            else:
+                # All pretrained attempts failed: fail fast (triggers optional degradation)
+                raise RuntimeError(
+                    f"Failed to load CLIP model '{model_name}' with any pretrained weights. "
+                    f"Check network connectivity or pre-download the model. "
+                    f"Original error: {first_err}"
+                ) from first_err
 
         # On MPS, force float32 for safety (MPS has incomplete float16 support)
         if self.device_manager.device_type == "mps":
@@ -91,8 +103,13 @@ class CLIPFeaturesExtractor(BaseExtractor):
         self._model = None
         self._preprocess = None
         self._tokenizer = None
-        if self._torch and self.device_manager.device_type == "cuda":
-            self._torch.cuda.empty_cache()
+        if self._torch:
+            if self.device_manager.device_type == "cuda":
+                self._torch.cuda.empty_cache()
+            elif self.device_manager.device_type == "mps":
+                # MPS empty_cache available since PyTorch 2.1
+                if hasattr(self._torch, "mps") and hasattr(self._torch.mps, "empty_cache"):
+                    self._torch.mps.empty_cache()
 
     def extract(self, context: ReadonlyEvalContext) -> dict:
         """Encode frames with CLIP model and return L2-normalized features.
