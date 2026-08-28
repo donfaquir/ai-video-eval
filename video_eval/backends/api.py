@@ -141,14 +141,58 @@ class APIBackend(BaseBackend):
             raise RuntimeError(f"Unknown provider: {self._provider}")
 
     def _upload_video(self, video_path: str) -> Any:
-        """Upload video to provider storage."""
+        """Upload/prepare video for the provider.
+
+        For dashscope: extract and cache frames as PIL Images.
+        For gemini: upload to Gemini File API.
+        For openai: return path (base64 encoded at call time).
+        """
         if self._provider == "gemini":
             return self._upload_gemini(video_path)
-        elif self._provider in ("openai", "dashscope"):
-            # OpenAI/DashScope do not have a separate upload step; return path directly
+        elif self._provider == "dashscope":
+            # Extract frames from video for multi-image input
+            return self._extract_frames_for_api(video_path)
+        elif self._provider == "openai":
             return video_path
         else:
             raise RuntimeError(f"Unknown provider: {self._provider}")
+
+    def _extract_frames_for_api(self, video_path: str) -> list:
+        """Extract a few representative frames from video as PIL Images."""
+        import subprocess
+        import io
+        from PIL import Image
+
+        frames = []
+        # Sample 4 frames evenly across the video
+        # Get duration first
+        probe_cmd = [
+            "ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+            "-of", "csv=p=0", video_path
+        ]
+        try:
+            dur_result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=10)
+            duration = float(dur_result.stdout.strip() or "10")
+        except Exception:
+            duration = 10.0
+
+        timestamps = [duration * i / 5 for i in range(1, 5)]  # 20%, 40%, 60%, 80%
+
+        for ts in timestamps:
+            cmd = [
+                "ffmpeg", "-ss", f"{ts:.2f}", "-i", video_path,
+                "-vframes", "1", "-f", "image2pipe", "-vcodec", "png",
+                "-loglevel", "quiet", "pipe:1",
+            ]
+            try:
+                result = subprocess.run(cmd, capture_output=True, timeout=10)
+                if result.returncode == 0 and result.stdout:
+                    img = Image.open(io.BytesIO(result.stdout))
+                    frames.append(img)
+            except Exception:
+                continue
+
+        return frames
 
     # ------------------------------------------------------------------
     # Gemini implementation
@@ -262,53 +306,58 @@ class APIBackend(BaseBackend):
         """Initialize the DashScope client (OpenAI-compatible API)."""
         try:
             import openai
+            import httpx
         except ImportError:
             raise RuntimeError(
-                "openai package is not installed. "
+                "openai and httpx packages are required. "
                 "DashScope uses OpenAI-compatible API. "
-                "Install it with: pip install openai"
+                "Install with: pip install openai httpx"
             )
 
         # DashScope uses OpenAI-compatible endpoint
         base_url = self.config.get(
             "base_url", "https://dashscope.aliyuncs.com/compatible-mode/v1"
         )
-        client = openai.OpenAI(api_key=self._api_key, base_url=base_url)
+        # Use httpx client with SSL verification disabled to handle
+        # environments with certificate issues (common in China)
+        http_client = httpx.Client(verify=False)
+        client = openai.OpenAI(
+            api_key=self._api_key, base_url=base_url, http_client=http_client
+        )
         return client
 
     def _call_dashscope(self, video_ref: Any, prompt: str) -> str:
-        """Call DashScope API (Qwen-VL series) with video and prompt.
+        """Call DashScope API (Qwen-VL series) with frames as images + prompt.
 
-        DashScope supports video via URL or base64. For local files,
-        we encode as base64. Supports models like qwen-vl-max, qwen-vl-plus.
+        DashScope VLM supports multi-image input. We send sampled frames
+        as base64-encoded images rather than the full video file (which may
+        be too large for base64 inline and cause connection errors).
+        video_ref here is the list of preprocessed frame images (from D8 cache).
         """
         import base64
+        import io
 
-        # Read video file and encode as base64
-        with open(video_ref, "rb") as f:
-            video_data = base64.b64encode(f.read()).decode("utf-8")
+        content: list[dict] = []
 
-        mime_type = self._guess_video_mime(video_ref)
+        # Send frames as images (up to 4 frames to keep request size reasonable)
+        frames_to_send = video_ref if isinstance(video_ref, list) else []
+        max_frames = min(len(frames_to_send), 4)
+        for img in frames_to_send[:max_frames]:
+            # Convert PIL Image to base64 PNG
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{img_b64}"},
+            })
+
+        # Add text prompt
+        content.append({"type": "text", "text": prompt})
 
         response = self._client.chat.completions.create(
             model=self._model,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "video_url",
-                            "video_url": {
-                                "url": f"data:{mime_type};base64,{video_data}",
-                            },
-                        },
-                        {
-                            "type": "text",
-                            "text": prompt,
-                        },
-                    ],
-                }
-            ],
+            messages=[{"role": "user", "content": content}],
             timeout=self._timeout,
         )
         return response.choices[0].message.content or ""
