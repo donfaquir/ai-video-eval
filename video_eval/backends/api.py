@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 
 @register_backend("api")
 class APIBackend(BaseBackend):
-    """Cloud VLM API backend supporting Gemini and OpenAI providers."""
+    """Cloud VLM API backend supporting Gemini, OpenAI, and DashScope (Alibaba) providers."""
 
     name = "api"
     version = "0.1.0"
@@ -114,12 +114,9 @@ class APIBackend(BaseBackend):
 
     def _get_api_key_env_var(self) -> str:
         """Return the environment variable name for the API key."""
-        if self._provider == "gemini":
-            return "GEMINI_API_KEY"
-        elif self._provider == "openai":
-            return "OPENAI_API_KEY"
-        else:
-            return f"{self._provider.upper()}_API_KEY"
+        if self._provider == "dashscope":
+            return "DASHSCOPE_API_KEY"
+        return f"{self._provider.upper()}_API_KEY"
 
     def _init_client(self) -> Any:
         """Initialize the provider SDK client."""
@@ -127,6 +124,8 @@ class APIBackend(BaseBackend):
             return self._init_gemini()
         elif self._provider == "openai":
             return self._init_openai()
+        elif self._provider == "dashscope":
+            return self._init_dashscope()
         else:
             raise RuntimeError(f"Unknown provider: {self._provider}")
 
@@ -136,6 +135,8 @@ class APIBackend(BaseBackend):
             return self._call_gemini(video_ref, prompt)
         elif self._provider == "openai":
             return self._call_openai(video_ref, prompt)
+        elif self._provider == "dashscope":
+            return self._call_dashscope(video_ref, prompt)
         else:
             raise RuntimeError(f"Unknown provider: {self._provider}")
 
@@ -143,8 +144,8 @@ class APIBackend(BaseBackend):
         """Upload video to provider storage."""
         if self._provider == "gemini":
             return self._upload_gemini(video_path)
-        elif self._provider == "openai":
-            # OpenAI does not have a separate upload step; return path directly
+        elif self._provider in ("openai", "dashscope"):
+            # OpenAI/DashScope do not have a separate upload step; return path directly
             return video_path
         else:
             raise RuntimeError(f"Unknown provider: {self._provider}")
@@ -221,6 +222,65 @@ class APIBackend(BaseBackend):
         NOTE: OpenAI's vision API primarily supports images.
         For video, we read the file and encode as base64.
         This may need adjustment based on OpenAI's video support evolution.
+        """
+        import base64
+
+        # Read video file and encode as base64
+        with open(video_ref, "rb") as f:
+            video_data = base64.b64encode(f.read()).decode("utf-8")
+
+        mime_type = self._guess_video_mime(video_ref)
+
+        response = self._client.chat.completions.create(
+            model=self._model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "video_url",
+                            "video_url": {
+                                "url": f"data:{mime_type};base64,{video_data}",
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": prompt,
+                        },
+                    ],
+                }
+            ],
+            timeout=self._timeout,
+        )
+        return response.choices[0].message.content or ""
+
+    # ------------------------------------------------------------------
+    # DashScope (Alibaba Cloud / Bailian) implementation
+    # ------------------------------------------------------------------
+
+    def _init_dashscope(self) -> Any:
+        """Initialize the DashScope client (OpenAI-compatible API)."""
+        try:
+            import openai
+        except ImportError:
+            raise RuntimeError(
+                "openai package is not installed. "
+                "DashScope uses OpenAI-compatible API. "
+                "Install it with: pip install openai"
+            )
+
+        # DashScope uses OpenAI-compatible endpoint
+        base_url = self.config.get(
+            "base_url", "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        )
+        client = openai.OpenAI(api_key=self._api_key, base_url=base_url)
+        return client
+
+    def _call_dashscope(self, video_ref: Any, prompt: str) -> str:
+        """Call DashScope API (Qwen-VL series) with video and prompt.
+
+        DashScope supports video via URL or base64. For local files,
+        we encode as base64. Supports models like qwen-vl-max, qwen-vl-plus.
         """
         import base64
 
